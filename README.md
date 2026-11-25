@@ -13,7 +13,8 @@ machine with no engine installed:
 | `HaivenSessionCore.h` | `Haiven::FSessionCore`: auth handshake, re-auth, request recovery |
 | `HaivenFrames.h` | server frames parsed from text and client frames written to text |
 | `HaivenJson.h` | the JSON reader/writer the SDK uses: never throws, bounded depth, locale-independent |
-| `HaivenChatCore.h` | `Haiven::FChatCore`: headless chat whose sends survive a reconnect |
+| `HaivenChatCore.h` | `Haiven::FChatCore`: headless chat whose sends survive a reconnect, with typing and the `chat.channel.active` mark |
+| `HaivenSessionChatCore.h` | `Haiven::FSessionChatChannelFilter`: a P2P session's chat, filtered to the `chatChannelId` of its create or join reply |
 | `HaivenRewardsCore.h` | `Haiven::FRewardClaims`: subscriber-reward claims whose retries reuse the claim id, with each refusal as a finite result; `Save` / `ExportSaved` / `ImportSaved` keep a claim id before link and the host posts it later; server grant and confirm requests |
 | `HaivenPlayerAccess.h` | `Haiven::FPlayerAccess`: thin Phase 1 game-access request/reply helper and open player-status lookup, including founder, without coupling status to eligibility |
 | `HaivenAnalyticsCore.h` | `Haiven::FAnalyticsBatcherCore`: bounded, contract-validated event snapshots, stable retry payloads, capped backoff, idle state, and finite configuration/input diagnostics; the host supplies timers and HTTP |
@@ -28,13 +29,28 @@ Do not edit the generated headers; rerun `make emit`.
 
 ## Quickstart
 
-Install the package, or add it from a checkout:
+Clone the header-only SDK into your project.
+
+```sh
+git clone https://github.com/haiven-dev/haiven-sdk-cpp.git third_party/haiven-sdk-cpp
+git -C third_party/haiven-sdk-cpp checkout --detach 44480a20eeb40045505a81ef6b0c8240b1183dec
+```
+
+Each GitHub release of `haiven-sdk-cpp` also carries the same source as
+`haiven-sdk-cpp-source-<version>.zip`, with its digest in `SHA256SUMS`. It
+unpacks to `haiven-sdk-cpp/`, which you can use in place of the clone.
+
+Add the source to your `CMakeLists.txt`. Replace `game` with your target name.
 
 ```cmake
-find_package(haiven CONFIG REQUIRED)     # after: cmake -S sdks/cpp -B build && cmake --install build
-# or: add_subdirectory(path/to/this/directory)
+add_subdirectory(third_party/haiven-sdk-cpp)
 target_link_libraries(game PRIVATE haiven::haiven)
 ```
+
+For a CMake installation, configure and install from the checkout with
+`cmake -S third_party/haiven-sdk-cpp -B build/haiven` and
+`cmake --install build/haiven --prefix ./third_party/haiven`. Point
+`CMAKE_PREFIX_PATH` at that prefix and use `find_package(haiven CONFIG REQUIRED)`.
 
 The SDK never opens a socket. Implement `Haiven::IHttpTransport` and
 `Haiven::IWebSocketTransport` over the networking your game already has
@@ -78,13 +94,103 @@ Realtime.Session().OnEvent = [](const Haiven::FServerFrame& Frame, const std::st
 Realtime.Send(Haiven::Ws::ChatSend(R"({"channelId":"c1","text":"hi"})"));
 ```
 
+Session chat is the chat channel of a P2P session. Build an
+`FSessionChatChannelFilter` from the `ChatChannelId` of the create or join reply
+(`RestTypes::CreateResponse`, `RestTypes::JoinResponse`) and forward the
+session's events to it. It hands the game only that channel's messages, edits,
+deletions and typing, sends on that channel, and marks it open with
+`chat.channel.active`. An empty id throws `std::invalid_argument`, and sends
+after `Dispose` throw `std::logic_error`. The chat must outlive the filter.
+
+The chat also needs the session's replies and its close. Without `OnReply`
+every send stays `Sending`. Without `OnClosed`, the chat keeps a pointer to a
+session that the next `Connect` frees. `Connect` replaces the session, so route
+all three handlers again on each new `Session()`:
+
+```cpp
+#include "HaivenSessionChatCore.h"
+
+// A chat.send reply, decoded as the Unreal plugin's FHaivenChat::HandleReply does.
+void HandleChatReply(Haiven::FChatCore& Chat, const Haiven::FServerFrame& Frame, const std::string& Json)
+{
+	std::optional<std::string> ModerationState, MessageId;
+	Haiven::WsServerReplyV0 Reply;
+	Haiven::ChatMessageSubmissionV0 Submission;
+	std::string Problem;
+	if (Frame.Success.value_or(false) && Haiven::ContractsJson::FromJson(Json, Reply, Problem)
+		&& Reply.Payload.has_value() && Haiven::ContractsJson::FromJson(*Reply.Payload, Submission, Problem))
+	{
+		ModerationState = Submission.ModerationState;
+		MessageId = Submission.Message.Id;
+	}
+	Chat.HandleReply(Frame, ModerationState, MessageId);
+}
+
+Haiven::FChatCore Chat(NewClientMessageId);
+Haiven::FSessionChatChannelFilter SessionChat(Chat, Created.ChatChannelId.value_or(""));
+SessionChat.OnMessage = [](const Haiven::ChatMessageV0& /* Message */) { /* ... */ };
+
+auto RouteChat = [&](Haiven::FSessionCore& Session) {
+	Session.OnEvent = [&](const Haiven::FServerFrame& Frame, const std::string& Json) {
+		SessionChat.HandleEvent(Frame, Json);
+	};
+	Session.OnReply = [&](const Haiven::FServerFrame& Frame, const std::string& Json) {
+		if (Frame.Type == "chat.send") HandleChatReply(Chat, Frame, Json);
+		if (Frame.Type == "session.resume") {
+			if (Frame.Success.value_or(false)) {
+				Chat.Attach(Realtime.Session());
+				Chat.SetActiveChannel(SessionChat.GetChannelId());
+			} else {
+				// Refused: the session is over. Dispose first, so Attach writes no mark.
+				SessionChat.Dispose();
+				Chat.Attach(Realtime.Session());
+			}
+		}
+		// ... the game's own replies
+	};
+	Session.OnClosed = [&](int, const std::string&) { Chat.HandleClosed(); };
+};
+RouteChat(Realtime.Session());
+Chat.Attach(Realtime.Session());   // the socket the create or join went through
+SessionChat.Send("gg");
+```
+
+After a drop, connect again, route the new session, and resume. The server
+forgets the mark when the socket closes, and refuses it from a new socket until
+the participation has resumed there. A send left unconfirmed by the drop is
+resent on `Attach`, before any resume. So the `session.resume` reply handler
+above attaches the chat and marks the channel again, and nothing attaches before
+it. Until then, `Send` keeps the message to resend on `Attach`, and
+`SendTyping` writes nothing.
+
+A refused resume is an ordinary end of the session: the session ended during
+the drop, or the resume token was rejected. The chat must still be attached to
+the new session, or every later send on any channel stays `Unconfirmed` and
+typing is dropped. So on a refused resume the handler above calls
+`SessionChat.Dispose()` and then `Chat.Attach(Realtime.Session())`. Session sends
+held through the drop are resent and refused with `not_channel_member`, which is
+final, and other channels work again. Do the same, in place of sending
+`session.resume`, when the game will not resume: the server holds a dropped
+participation for 30 seconds, and after that a resume can only be refused.
+
+```cpp
+Realtime.Connect(Error);
+RouteChat(Realtime.Session());
+Realtime.Send(Haiven::Ws::SessionResume(ResumeJson));   // a SessionResumeRequestV0
+```
+
+`Connect` frees the previous session without closing it. If that session is
+still open, call `Realtime.Close()` first, so `OnClosed` reaches the chat.
+
 `RandomBytes` must come from the platform's secure random source. `Now()` is
 `Haiven::Handoff::FTicks` since any fixed epoch, for example
 `std::chrono::duration_cast<Haiven::Handoff::FTicks>(std::chrono::system_clock::now().time_since_epoch())`.
 
 The credential is opaque and its absolute expiry comes only from exchange
 metadata. `FCore::Restart` clears it and starts a fresh handoff for metadata
-expiry, REST `401`, or WebSocket `auth.expired`; there is no web refresh path.
+expiry, REST `401`, WebSocket `auth.expired`, a `1008 credential_revoked` close
+(`CredentialRevoked`), or a handshake refused with `1008 unauthorized`
+(`CredentialRefused`); there is no web refresh path.
 
 ## Who uses it
 
@@ -129,6 +235,13 @@ it under GCC, Apple Clang and MSVC. Both skip loudly without their toolchain.
 `test/conformance/`, and `make check-unreal` runs it through
 `scripts/check-unreal-conformance.py`.
 
+## License
+
+Haiven's source in this repository is licensed under the Apache License,
+Version 2.0 (SPDX `Apache-2.0`). The terms are in [LICENSE](LICENSE), and
+`cmake --install` installs the same file as `share/doc/haiven/LICENSE`.
+Contributions are accepted under that license.
+
 <!-- features:start (generated by codegen/features.py; do not edit) -->
 
 ### Feature coverage
@@ -142,6 +255,7 @@ it under GCC, Apple Clang and MSVC. Both skip loudly without their toolchain.
 | REST | ○ | ○ |
 | Game login handoff | ○ | ○ |
 | P2P sessions | ○ | ○ |
+| Credential lifecycle | ~ | ✅ |
 | API surface | ✅ | ✅ |
 | Product | ~ | ~ |
 | Developer experience | ~ | ~ |
