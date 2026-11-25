@@ -27,6 +27,7 @@ def make_key(path):
 def make_request(recipient="age1" + "p" * 58):
     return {
         "target": "cpp",
+        "lane": "main",
         "builder_sha": "c" * 40,
         "workflow_sha": "b" * 40,
         "source": {"carrier": "a" * 40, "base": "b" * 40, "sha256": "d" * 64},
@@ -45,52 +46,137 @@ class ShadowBuildTests(unittest.TestCase):
             {"builder_sha": "main"}, {"target": "dotnet", "dotnet": request["source"]},
             {"target": "unity-core"}, {"target": "bossroom", "workflow_sha": None},
             {"target": "godot"}, {"version": "main"}, {"recipient": "AGE-SECRET-KEY-EXAMPLE"},
+            {"lane": "shadow-source"}, {"lane": None}, {"lane": "pr"},
         ):
             with self.subTest(replace=replace), self.assertRaises(ValueError):
                 build.request(json.dumps({**request, **replace}))
         for target in sorted(build.LICENSED):
             licensed = {**request, "target": target}
             self.assertEqual(build.request(json.dumps(licensed)), licensed)
+        missing = dict(request)
+        del missing["lane"]
+        with self.assertRaises(ValueError):
+            build.request(json.dumps(missing))
 
     def test_licensed_placement_uses_pinned_engines_or_named_runners(self):
-        variables = {name: "" for name in build.RUNNER_VARIABLES.values()}
+        variables = {
+            name: "" for names in build.LANE_RUNNER_VARIABLES.values() for name in names.values()
+        }
         with patch.dict(build.os.environ, variables):
-            for platform, image in build.UNITY_IMAGES.items():
-                self.assertIn(build.UNITY_VERSION, image)
-                self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
-                self.assertEqual(build.placement("bossroom", platform), ("ubuntu-24.04", image))
-                self.assertEqual(build.host("bossroom", platform), "linux-x64")
-            self.assertRegex(build.UNREAL_IMAGE, r"dev-slim-5\.8\.2@sha256:[0-9a-f]{64}$")
-            for target in ("unreal", "unreal-chat"):
-                self.assertEqual(
-                    build.placement(target, "linux-x64"), ("ubuntu-24.04", build.UNREAL_IMAGE)
-                )
-            for target, platform in (
-                ("unreal", "windows-x64"), ("unreal-chat", "macos"), ("lyra", "linux-x64"),
-            ):
-                with self.subTest(target=target, platform=platform), self.assertRaises(ValueError):
-                    build.placement(target, platform)
-            self.assertEqual(build.placement("cpp", "macos"), ("macos-15", ""))
+            for lane in build.SOURCE_ENVIRONMENTS:
+                for platform, image in build.UNITY_IMAGES.items():
+                    self.assertIn(build.UNITY_VERSION, image)
+                    self.assertRegex(image, r"@sha256:[0-9a-f]{64}$")
+                    self.assertEqual(
+                        build.placement("bossroom", platform, lane), ("ubuntu-24.04", image)
+                    )
+                    self.assertEqual(build.host("bossroom", platform), "linux-x64")
+                self.assertRegex(build.UNREAL_IMAGE, r"dev-slim-5\.8\.2@sha256:[0-9a-f]{64}$")
+                for target in ("unreal", "unreal-chat"):
+                    self.assertEqual(
+                        build.placement(target, "linux-x64", lane),
+                        ("ubuntu-24.04", build.UNREAL_IMAGE),
+                    )
+                for target, platform in (
+                    ("unreal", "windows-x64"), ("unreal-chat", "macos"), ("lyra", "linux-x64"),
+                ):
+                    with (
+                        self.subTest(target=target, platform=platform, lane=lane),
+                        self.assertRaises(ValueError),
+                    ):
+                        build.placement(target, platform, lane)
+                self.assertEqual(build.placement("cpp", "macos", lane), ("macos-15", ""))
         named = {build.RUNNER_VARIABLES["windows-x64"]: "haiven-unreal-windows"}
         with patch.dict(build.os.environ, named):
             self.assertEqual(
-                build.placement("lyra", "windows-x64"), ("haiven-unreal-windows", "")
+                build.placement("lyra", "windows-x64", "main"), ("haiven-unreal-windows", "")
             )
             self.assertEqual(build.host("lyra", "windows-x64"), "windows-x64")
         for label in ("", "a b", "x" * 101, "-flag", "label\nother=value"):
-            with patch.dict(build.os.environ, {build.RUNNER_VARIABLES["macos"]: label}):
-                with self.subTest(label=label), self.assertRaises(ValueError):
-                    build.placement("unreal", "macos")
+            for variables in (build.RUNNER_VARIABLES, build.PR_RUNNER_VARIABLES):
+                with patch.dict(build.os.environ, {variables["macos"]: label}):
+                    lane = "main" if variables is build.RUNNER_VARIABLES else "pull_request"
+                    with self.subTest(label=label, lane=lane), self.assertRaises(ValueError):
+                        build.placement("unreal", "macos", lane)
+
+    def test_pull_request_jobs_never_share_a_named_runner_with_main(self):
+        main = build.RUNNER_VARIABLES["macos"]
+        pull = build.PR_RUNNER_VARIABLES["macos"]
+        with patch.dict(build.os.environ, {main: "haiven-unreal-macos", pull: ""}):
+            self.assertEqual(
+                build.placement("unreal", "macos", "main"), ("haiven-unreal-macos", "")
+            )
+            # No fallback to the main label for a pull-request job.
+            with self.assertRaisesRegex(ValueError, pull):
+                build.placement("unreal", "macos", "pull_request")
+        with patch.dict(build.os.environ, {main: "haiven-unreal-macos", pull: "haiven-pr-macos"}):
+            for lane, label in (("main", "haiven-unreal-macos"), ("pull_request", "haiven-pr-macos")):
+                self.assertEqual(build.placement("unreal-chat", "macos", lane), (label, ""))
+        # Equal labels are refused in both lanes, ignoring case as GitHub does.
+        for pr_label in ("haiven-unreal-macos", "Haiven-Unreal-MacOS"):
+            with patch.dict(build.os.environ, {main: "haiven-unreal-macos", pull: pr_label}):
+                for lane in build.SOURCE_ENVIRONMENTS:
+                    with (
+                        self.subTest(pr_label=pr_label, lane=lane),
+                        self.assertRaisesRegex(ValueError, "separate runners"),
+                    ):
+                        build.placement("lyra", "macos", lane)
+        # A default self-hosted label could pick the other lane's runner.
+        for label in ("self-hosted", "Self-Hosted", "macOS", "ARM64", "x64"):
+            for lane, variable in (("main", main), ("pull_request", pull)):
+                with (
+                    patch.dict(build.os.environ, {main: "", pull: "", variable: label}),
+                    self.subTest(label=label, lane=lane),
+                    self.assertRaisesRegex(ValueError, "every self-hosted runner"),
+                ):
+                    build.placement("unreal", "macos", lane)
+        # Fresh-VM placements stay shared between the lanes.
+        with patch.dict(build.os.environ, {main: "", pull: ""}):
+            self.assertEqual(
+                build.placement("unreal", "linux-x64", "pull_request"),
+                build.placement("unreal", "linux-x64", "main"),
+            )
+
+    def test_plan_places_pull_request_jobs_on_their_own_runners(self):
+        request = {**make_request(), "target": "lyra", "lane": "pull_request"}
+        labels = {
+            **{name: f"main-{platform}" for platform, name in build.RUNNER_VARIABLES.items()},
+            **{name: f"pr-{platform}" for platform, name in build.PR_RUNNER_VARIABLES.items()},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "github-output"
+            env = {
+                "EXPECTED_TARGET": "lyra", "GITHUB_SHA": "b" * 40, "GITHUB_OUTPUT": str(output),
+                **labels,
+            }
+            with patch.dict(build.os.environ, env), patch.object(build, "require_builder"):
+                build.plan(json.dumps(request))
+                text = output.read_text()
+                self.assertIn("environment=shadow-source-pr\n", text)
+                for platform in build.RUNNERS:
+                    self.assertIn(f'"runner":"pr-{platform}"', text)
+                self.assertNotIn('"runner":"main-', text)
+                output.write_text("")
+                build.plan(json.dumps({**request, "lane": "main"}))
+                self.assertIn('"runner":"main-macos"', output.read_text())
+                self.assertNotIn('"runner":"pr-', output.read_text())
 
     def test_readme_names_the_engine_secrets_and_runner_variables(self):
         root = Path(__file__).resolve().parents[2]
         readme = (root / ".github/shadow-build/README.md").read_text()
-        for name in ("UNITY_LICENSE", "UNITY_SERIAL", "EPIC_GHCR_TOKEN", "SDK_SHADOW_RUNNER_MACOS"):
+        for name in (
+            "UNITY_LICENSE", "UNITY_SERIAL", "EPIC_GHCR_TOKEN", "SDK_SHADOW_RUNNER_MACOS",
+            "SDK_SHADOW_PR_RUNNER_MACOS",
+        ):
             self.assertIn(name, readme)
 
     def test_cpp_workflow_is_dispatch_only_and_read_only(self):
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github/workflows/shadow-build.yml").read_text()
+        # The source key comes from the environment the request's lane selects.
+        self.assertIn("      environment: ${{ steps.plan.outputs.environment }}\n", workflow)
+        self.assertIn("    environment: ${{ needs.request.outputs.environment }}\n", workflow)
+        self.assertNotIn("environment: shadow-source", workflow)
         self.assertRegex(workflow, r"on:\n  workflow_dispatch:")
         self.assertRegex(workflow, r"permissions:\n  contents: read\n\n")
         self.assertIn("EXPECTED_TARGET: 'cpp'", workflow)
@@ -104,6 +190,10 @@ class ShadowBuildTests(unittest.TestCase):
             with patch.dict(build.os.environ, env), patch.object(build, "require_builder"):
                 build.plan(json.dumps(request))
                 self.assertIn("base_sha=" + "b" * 40, output.read_text())
+                self.assertIn("environment=shadow-source\n", output.read_text())
+                output.write_text("")
+                build.plan(json.dumps({**request, "lane": "pull_request"}))
+                self.assertIn("environment=shadow-source-pr\n", output.read_text())
                 self.assertIn('"runner":"windows-2025","image":""', output.read_text())
                 for change in (
                     {**request, "target": "cli"},

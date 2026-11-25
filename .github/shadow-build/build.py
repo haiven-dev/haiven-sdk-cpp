@@ -54,6 +54,24 @@ RUNNER_VARIABLES = {
     "windows-x64": "SDK_SHADOW_RUNNER_WINDOWS_X64",
     "macos": "SDK_SHADOW_RUNNER_MACOS",
 }
+# Pull-request jobs that need a named runner use their own label. A runner
+# that kept state from unmerged code could capture the `main` source identity
+# in the next `main` job it took, so the two lanes never share a label, and
+# a pull-request job never falls back to the `main` label.
+PR_RUNNER_VARIABLES = {
+    "linux-x64": "SDK_SHADOW_PR_RUNNER_LINUX_X64",
+    "windows-x64": "SDK_SHADOW_PR_RUNNER_WINDOWS_X64",
+    "macos": "SDK_SHADOW_PR_RUNNER_MACOS",
+}
+LANE_RUNNER_VARIABLES = {"main": RUNNER_VARIABLES, "pull_request": PR_RUNNER_VARIABLES}
+# GitHub gives every self-hosted runner these labels, so a job asking for one
+# could land on any runner, including one that serves the other lane.
+DEFAULT_RUNNER_LABELS = frozenset(("self-hosted", "linux", "windows", "macos", "x64", "arm", "arm64"))
+# The request's lane picks the environment, and so the source key, that the
+# build job decrypts with. Unmerged pull-request code runs in the same job as
+# its decrypted source, so pull-request stages use their own key per target:
+# a key that code leaks cannot open a diff staged from `main`.
+SOURCE_ENVIRONMENTS = {"main": "shadow-source", "pull_request": "shadow-source-pr"}
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -100,19 +118,38 @@ def host(target: str, platform: str) -> str:
     return "linux-x64" if target == "bossroom" and platform != "portable" else platform
 
 
-def placement(target: str, platform: str) -> tuple[str, str]:
-    """Return the runner label and engine image; no image means the runner holds the engine."""
+def placement(target: str, platform: str, lane: str) -> tuple[str, str]:
+    """Return the runner label and engine image; no image means the runner holds the engine.
+
+    Standard runners and the pinned engine images run every job on a fresh VM,
+    so both lanes share them. A named runner is the lane's own: the label must
+    differ from the other lane's (runner labels ignore case) and must not be a
+    label GitHub gives every self-hosted runner.
+    """
     if target == "bossroom":
         return RUNNERS["linux-x64"], UNITY_IMAGES[platform]
     if target in {"unreal", "unreal-chat"} and platform == "linux-x64":
         return RUNNERS[platform], UNREAL_IMAGE
     if target in LICENSED:
-        variable = RUNNER_VARIABLES[platform]
+        variable = LANE_RUNNER_VARIABLES[lane][platform]
         label = os.environ.get(variable, "")
         if not LABEL.fullmatch(label):
             raise ValueError(
                 f"set the {variable} repository variable to a runner that holds "
                 f"Unreal Engine {UNREAL_VERSION}"
+                + (" and never runs a main-lane job" if lane == "pull_request" else "")
+            )
+        if label.lower() in DEFAULT_RUNNER_LABELS:
+            raise ValueError(
+                f"{variable} names {label}, a label every self-hosted runner carries; "
+                "name a label only this lane's runners carry"
+            )
+        other = next(name for name in SOURCE_ENVIRONMENTS if name != lane)
+        other_variable = LANE_RUNNER_VARIABLES[other][platform]
+        if label.lower() == os.environ.get(other_variable, "").lower():
+            raise ValueError(
+                f"{variable} equals {other_variable}: pull-request and main-lane jobs "
+                "must run on separate runners"
             )
         return label, ""
     return RUNNERS.get(platform, "ubuntu-24.04"), ""
@@ -126,6 +163,7 @@ class SourceDiff(TypedDict):
 
 class BuildRequest(TypedDict):
     target: str
+    lane: str
     builder_sha: str
     workflow_sha: str | None
     source: SourceDiff
@@ -151,13 +189,16 @@ def require_diff(raw: object) -> SourceDiff:
 def request(data: str) -> BuildRequest:
     raw = json.loads(data)
     if not isinstance(raw, dict) or set(raw) != {
-        "target", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
-    } or not all(isinstance(raw[name], str) for name in ("target", "builder_sha", "request_id", "recipient")):
+        "target", "lane", "builder_sha", "workflow_sha", "source", "dotnet", "request_id", "recipient"
+    } or not all(
+        isinstance(raw[name], str) for name in ("target", "lane", "builder_sha", "request_id", "recipient")
+    ):
         raise ValueError("invalid build request")
     target = raw["target"]
     companion = target in {"unity-core", "godot-dotnet"}
     if (
         target not in TARGETS
+        or raw["lane"] not in SOURCE_ENVIRONMENTS
         or not SHA.fullmatch(raw["builder_sha"])
         or not isinstance(raw["workflow_sha"], str)
         or not SHA.fullmatch(raw["workflow_sha"])
@@ -184,12 +225,13 @@ def plan(data: str) -> None:
     require_builder(values["builder_sha"])
     rows = []
     for platform in platforms(target):
-        runner, image = placement(target, platform)
+        runner, image = placement(target, platform, values["lane"])
         rows.append({"platform": platform, "runner": runner, "image": image})
     matrix = {"include": rows}
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         for name in ("target", "request_id"):
             print(f"{name}={values[name]}", file=output)
+        print(f"environment={SOURCE_ENVIRONMENTS[values['lane']]}", file=output)
         print(f"base_sha={values['source']['base']}", file=output)
         print(f"dotnet_base={values['dotnet']['base'] if values['dotnet'] else ''}", file=output)
         print(f"matrix={json.dumps(matrix, separators=(',', ':'))}", file=output)

@@ -1,0 +1,3 @@
+# Python bytecode from running the shadow builder and its tests.
+__pycache__/
+*.py[cod]
